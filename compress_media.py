@@ -94,53 +94,47 @@ GS_CMD = _check_ghostscript()
 # 压缩预设
 # ──────────────────────────────────────────────────────────────────
 PRESETS: Dict[str, dict] = {
-    # 均衡 —— 肉眼几乎感知不到质量损失，压缩率可观
+    # 均衡 —— 极限体积优先（视频 x265 + 降帧 + 低码率音频）
     "balanced": {
         "image_quality": 75,
         "image_max_dim": 2560,
         "image_max_dpi": 150,       # 独立图片：超过此 DPI 则按比例缩小像素
         "audio_codec": "aac",
-        "audio_bitrate": "128k",
-        "video_codec": "libx264",
-        "video_crf": 23,
+        "audio_bitrate": "8k",
+        "video_codec": "libx265",
+        "video_crf": 34,
         "video_preset": "medium",
-        "video_max_w": 1920,
-        "video_max_h": 1080,
-        "video_audio_bitrate": "128k",
+        "video_audio_bitrate": "8k",
         "doc_quality": 72,
         "doc_max_dim": 1920,
         "doc_max_dpi": 150,         # 文档内图片：依据显示尺寸限制像素密度
     },
-    # 激进 —— 最大压缩，较小分辨率，少量可感知损失
+    # 激进 —— 最大压缩，画质次于 balanced
     "aggressive": {
         "image_quality": 60,
         "image_max_dim": 1920,
         "image_max_dpi": 96,
         "audio_codec": "aac",
-        "audio_bitrate": "96k",
-        "video_codec": "libx264",
-        "video_crf": 28,
+        "audio_bitrate": "8k",
+        "video_codec": "libx265",
+        "video_crf": 38,
         "video_preset": "medium",
-        "video_max_w": 1280,
-        "video_max_h": 720,
-        "video_audio_bitrate": "96k",
+        "video_audio_bitrate": "8k",
         "doc_quality": 60,
         "doc_max_dim": 1280,
         "doc_max_dpi": 96,
     },
-    # 高质量 —— 质量优先，适合归档
+    # 高质量 —— 仍保持 x265，但给更低 CRF
     "high": {
         "image_quality": 85,
         "image_max_dim": 4096,
         "image_max_dpi": 200,
         "audio_codec": "aac",
-        "audio_bitrate": "192k",
-        "video_codec": "libx264",
-        "video_crf": 20,
+        "audio_bitrate": "8k",
+        "video_codec": "libx265",
+        "video_crf": 30,
         "video_preset": "slow",
-        "video_max_w": 3840,
-        "video_max_h": 2160,
-        "video_audio_bitrate": "192k",
+        "video_audio_bitrate": "8k",
         "doc_quality": 82,
         "doc_max_dim": 2560,
         "doc_max_dpi": 200,
@@ -324,7 +318,8 @@ def compress_audio_file(src: Path, dst: Path, preset: dict) -> Optional[Path]:
         "ffmpeg", "-y", "-i", str(src),
         "-c:a", preset["audio_codec"],
         "-b:a", preset["audio_bitrate"],
-        "-ar", "44100",
+        "-ar", "16000",
+        "-ac", "1",
         str(out_path),
     ]
     result = subprocess.run(cmd, capture_output=True, timeout=600)
@@ -343,32 +338,111 @@ def compress_audio_file(src: Path, dst: Path, preset: dict) -> Optional[Path]:
 # ──────────────────────────────────────────────────────────────────
 # 视频压缩
 # ──────────────────────────────────────────────────────────────────
-def compress_video_file(src: Path, dst: Path, preset: dict) -> Optional[Path]:
-    """使用 ffmpeg 将视频压缩为 H.264 MP4。"""
-    if not HAS_FFMPEG:
+def _probe_video_fps(src: Path) -> Optional[float]:
+    """用 ffprobe 获取原视频帧率（浮点）。"""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(src),
+        ]
+        r = subprocess.run(cmd, capture_output=True, timeout=30)
+        if r.returncode != 0:
+            return None
+        txt = r.stdout.decode(errors="ignore").strip()
+        if not txt:
+            return None
+        if "/" in txt:
+            a, b = txt.split("/", 1)
+            b = float(b)
+            if b == 0:
+                return None
+            return float(a) / b
+        return float(txt)
+    except Exception:
         return None
-    out_path = dst.with_suffix(".mp4")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    max_w, max_h = preset["video_max_w"], preset["video_max_h"]
-    # 缩放滤镜：保持比例不超过最大尺寸，宽高对齐为偶数
-    scale_filter = (
-        f"scale='if(gt(iw,{max_w}),{max_w},iw)':"
-        f"'if(gt(ih,{max_h}),{max_h},ih)':"
+
+def _build_video_scale_filter(max_dim: int) -> str:
+    """
+    统一视频缩放规则（与图片一致）：长边不超过 max_dim，保持比例并对齐偶数。
+    使用 if(gt()) 避免 ffmpeg 表达式里 min() 在部分构建上的兼容问题。
+    """
+    return (
+        f"scale='if(gt(iw,ih),if(gt(iw,{max_dim}),{max_dim},iw),-2)':"
+        f"'if(gt(ih,iw),if(gt(ih,{max_dim}),{max_dim},ih),-2)':"
         f"force_original_aspect_ratio=decrease,"
         f"scale=trunc(iw/2)*2:trunc(ih/2)*2"
     )
+
+
+def _compress_video_in_memory(src: Path, dst: Path, preset: dict) -> bool:
+    """
+    给 compress_pptx_file 用的内存内视频压缩。
+    与 compress_video_file 类似，但返回 bool 而不是 Optional[Path]。
+    若压缩后更大则返回 False（不替换）。
+    """
+    max_dim = int(preset.get("image_max_dim", 1920))
+    scale_filter = _build_video_scale_filter(max_dim)
+
+    src_fps = _probe_video_fps(src)
+    target_fps = 24.0 if not src_fps else min(24.0, src_fps)
+
     cmd = [
         "ffmpeg", "-y", "-i", str(src),
         "-c:v", preset["video_codec"],
         "-crf", str(preset["video_crf"]),
         "-preset", preset["video_preset"],
-        "-vf", scale_filter,
+        "-vf", f"{scale_filter},fps={target_fps:.3f}",
         "-c:a", "aac",
         "-b:a", preset["video_audio_bitrate"],
+        "-ar", "16000",
         "-movflags", "+faststart",
-        str(out_path),
     ]
+    if preset.get("video_codec") == "libx265":
+        cmd += ["-tag:v", "hvc1", "-x265-params", "log-level=error"]
+    cmd.append(str(dst))
+
+    result = subprocess.run(cmd, capture_output=True, timeout=7200)
+    if result.returncode != 0:
+        return False
+    # 若压缩后更大则视为失败
+    if dst.stat().st_size >= src.stat().st_size:
+        dst.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def compress_video_file(src: Path, dst: Path, preset: dict) -> Optional[Path]:
+    """使用 ffmpeg 将视频压缩为 x265 MP4，降帧到 min(24, 原始帧率)。"""
+    if not HAS_FFMPEG:
+        return None
+    out_path = dst.with_suffix(".mp4")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 视频分辨率规则与图片一致：使用 image_max_dim 作为长边上限
+    max_dim = int(preset.get("image_max_dim", 1920))
+    scale_filter = _build_video_scale_filter(max_dim)
+
+    src_fps = _probe_video_fps(src)
+    target_fps = 24.0 if not src_fps else min(24.0, src_fps)
+
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src),
+        "-c:v", preset["video_codec"],
+        "-crf", str(preset["video_crf"]),
+        "-preset", preset["video_preset"],
+        "-vf", f"{scale_filter},fps={target_fps:.3f}",
+        "-c:a", "aac",
+        "-b:a", preset["video_audio_bitrate"],
+        "-ar", "16000",
+        "-movflags", "+faststart",
+    ]
+    if preset.get("video_codec") == "libx265":
+        cmd += ["-tag:v", "hvc1", "-x265-params", "log-level=error"]
+    cmd.append(str(out_path))
     result = subprocess.run(cmd, capture_output=True, timeout=7200)
     if result.returncode != 0:
         err = result.stderr.decode(errors="ignore")[-300:]
@@ -556,7 +630,7 @@ def _pptx_compress_image_entry(
 
 def compress_pptx_file(src: Path, dst: Path, preset: dict) -> bool:
     """
-    压缩 PPTX 文件内嵌的图片。
+    压缩 PPTX 文件内嵌的媒体（图片 + 视频）。
     通过操作 ZIP 内部实现，不依赖 python-pptx。
     """
     if not HAS_PILLOW:
@@ -587,6 +661,36 @@ def compress_pptx_file(src: Path, dst: Path, preset: dict) -> bool:
             if not in_media:
                 continue
             ext = Path(name).suffix.lower()
+
+            # ── 处理视频 ────────────────────────────────────────────
+            if ext in VIDEO_EXTS and HAS_FFMPEG:
+                # 需要临时解压视频 → 压缩 → 读回内存
+                try:
+                    # 写临时文件
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tf:
+                        tmp_in = Path(tf.name)
+                    # 注意：若源文件本来就是 .mp4，with_suffix('.mp4') 会与 tmp_in 同路径
+                    # 必须使用不同文件名，否则 ffmpeg 会原地覆盖导致比较失效。
+                    tmp_out = tmp_in.with_name(tmp_in.stem + "_compressed.mp4")
+                    tmp_in.write_bytes(data)
+
+                    # 压缩视频（复用 compress_video_file 逻辑，但用内存路径）
+                    ok = _compress_video_in_memory(tmp_in, tmp_out, preset)
+                    if ok and tmp_out.exists():
+                        new_data = tmp_out.read_bytes()
+                        # 只有压缩后更小才替换
+                        if len(new_data) < len(data):
+                            new_contents[name] = new_data
+                            name_map[name] = name
+                        # 清理临时文件
+                        tmp_out.unlink(missing_ok=True)
+                    tmp_in.unlink(missing_ok=True)
+                except Exception as e:
+                    print(f"\n      跳过视频 [{name}]: {e}")
+                continue
+
+            # ── 处理图片 ─────────────────────────────────────────
             if ext not in IMAGE_EXTS or ext in (".emf", ".wmf"):
                 continue
             try:
@@ -1047,9 +1151,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 预设说明：
-  balanced   均衡（默认）  图片 75%/2560px  视频 CRF23/1080p  音频 128k
-  aggressive 激进压缩      图片 60%/1920px  视频 CRF28/720p   音频 96k
-  high       高质量归档    图片 85%/4096px  视频 CRF20/2160p  音频 192k
+  balanced   极限体积（默认） 图片 75%/2560px  视频 x265 CRF34 + FPS<=24  音频 8k
+  aggressive 更小体积         图片 60%/1920px  视频 x265 CRF38 + FPS<=24  音频 8k
+  high       质量优先         图片 85%/4096px  视频 x265 CRF30 + FPS<=24  音频 8k
 
 示例：
   python compress_media.py 素材/
@@ -1123,7 +1227,8 @@ def main():
         print(f"  预设：      {args.preset}")
         dpi_show = str(preset.get("doc_max_dpi", "—"))
         print(f"  图片质量：  {preset['image_quality']}%  最大边长：{preset['image_max_dim']}px  最大DPI：{dpi_show}")
-        print(f"  视频 CRF：  {preset['video_crf']}  音频码率：{preset['audio_bitrate']}")
+        print(f"  视频编码：  {preset['video_codec']}  CRF：{preset['video_crf']}  FPS：<=24")
+        print(f"  音频码率：  {preset['audio_bitrate']}  采样率：16kHz 单声道")
         print()
         print("  依赖状态：")
         print(f"    Pillow      {'✓' if HAS_PILLOW else '✗  pip install Pillow'}")
