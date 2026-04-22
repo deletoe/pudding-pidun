@@ -502,34 +502,56 @@ def _pptx_compress_image_entry(
     dpi_limit: Optional[int] = None,
 ) -> Tuple[str, bytes]:
     """
-    对 PPTX/ZIP 内单张图片进行压缩。
-    - dpi_limit：根据该图片在幻灯片中的显示尺寸和 max_dpi 计算出的像素上限；
-                 与 max_dim 取较小值作为实际像素约束。
-    - 有透明通道 → 压缩 PNG，保留原文件名
-    - 无透明通道 → 转换为 JPEG，文件名后缀改为 .jpg
+    对 PPTX/ZIP 内单张图片进行压缩（格式自适应）。
+
+    目标：在 PPT 可稳定支持的格式内（JPEG/PNG）选体积最小方案，
+    并确保不比原图更大。
+
+    策略：
+      1) 先按 max_dim 与 dpi_limit 做等比缩放
+      2) 生成 JPEG 与 PNG 两个候选（带透明通道时仅 PNG）
+      3) 与原始数据比较，选最小者
+
     返回 (新文件名, 新字节数据)
     """
     img = Image.open(io.BytesIO(data))
     img.load()
-    alpha = _has_alpha(img)
 
     # 综合 max_dim 与 DPI 限制，取更严格的约束
     effective_max = max_dim
     if dpi_limit and dpi_limit > 0:
         effective_max = min(effective_max, dpi_limit)
 
-    if alpha:
-        new_data = compress_image_to_png_bytes(data, effective_max)
-        new_name = name
-    else:
-        new_data = compress_image_to_jpeg_bytes(data, quality, effective_max)
-        stem = str(Path(name).with_suffix(""))
-        new_name = stem + ".jpg"
+    img = _resize_if_needed(img, effective_max)
+    alpha = _has_alpha(img)
 
-    # 只在压缩后更小时替换
-    if len(new_data) >= len(data):
+    candidates: List[Tuple[str, bytes]] = [(name, data)]
+
+    # PNG 候选（兼容透明）
+    png_buf = io.BytesIO()
+    if alpha:
+        img.save(png_buf, "PNG", optimize=True)
+    else:
+        img.convert("RGB").save(png_buf, "PNG", optimize=True)
+    candidates.append((str(Path(name).with_suffix(".png")), png_buf.getvalue()))
+
+    # JPEG 候选（无透明时）
+    if not alpha:
+        jpg_buf = io.BytesIO()
+        img_rgb = _to_rgb(img)
+        img_rgb.save(jpg_buf, "JPEG", quality=quality, optimize=True, progressive=True)
+        candidates.append((str(Path(name).with_suffix(".jpg")), jpg_buf.getvalue()))
+
+    # 选择最小体积候选；若并列，优先保留原文件名
+    best_name, best_data = min(
+        candidates,
+        key=lambda it: (len(it[1]), 0 if it[0] == name else 1),
+    )
+
+    # 不变小则不替换
+    if len(best_data) >= len(data):
         return name, data
-    return new_name, new_data
+    return best_name, best_data
 
 
 def compress_pptx_file(src: Path, dst: Path, preset: dict) -> bool:
@@ -769,22 +791,43 @@ def _pdf_page_recompress_images(page, quality: int, max_dim: int):
 
                 # 记录原始流大小（用于后续比较）
                 raw_orig_size = len(bytes(xobj.read_raw_bytes()))
+                filt = str(xobj.get("/Filter"))
 
                 pil_img = PdfImage(xobj).as_pil_image()
                 orig_w, orig_h = pil_img.size
                 pil_img = _resize_if_needed(pil_img, max_dim)
                 was_resized = (pil_img.size != (orig_w, orig_h))
+
+                # 对已高效编码（JPX / Flate+DCT）且未缩放的图片，直接跳过
+                # 避免把更高效编码降级为 JPEG 导致膨胀。
+                if not was_resized and (
+                    "/JPXDecode" in filt or ("/FlateDecode" in filt and "/DCTDecode" in filt)
+                ):
+                    continue
+
+                # 对位图图标/线稿（1bit 或极小图）通常 JPEG 更差，未缩放时跳过
+                bpc = int(xobj.get("/BitsPerComponent", 8))
+                if not was_resized and (bpc <= 1 or max(orig_w, orig_h) <= 256):
+                    continue
+
                 pil_img = _to_rgb(pil_img)
                 buf = io.BytesIO()
                 pil_img.save(buf, "JPEG", quality=quality, optimize=True)
                 jpeg_bytes = buf.getvalue()
 
-                # ── 核心判断：只在真正节省空间时才替换 ──────────────────
-                # 允许轻微膨胀（5%以内）仅当图片被缩放时（像素减少）
-                threshold = raw_orig_size * 1.05 if was_resized else raw_orig_size
-                if len(jpeg_bytes) >= threshold:
+                # 核心判断：只在真正节省空间时才替换
+                if len(jpeg_bytes) >= raw_orig_size:
                     continue  # 跳过：替换后不会变小
-                # ────────────────────────────────────────────────────────
+
+                # 若进行了缩放，要求至少有可见收益（默认至少减少 5%）
+                if was_resized and len(jpeg_bytes) > raw_orig_size * 0.95:
+                    continue
+
+                # 若没缩放，要求收益更明显（至少减少 10%）
+                if not was_resized and len(jpeg_bytes) > raw_orig_size * 0.90:
+                    continue
+
+                # ────────────────────────────────────────────────────────  
 
                 xobj.write(jpeg_bytes, filter=pikepdf.Name("/DCTDecode"))
                 xobj["/Width"]            = pil_img.width
