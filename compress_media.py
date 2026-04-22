@@ -37,6 +37,7 @@ import zipfile
 import tempfile
 import argparse
 import subprocess
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 
@@ -96,6 +97,7 @@ GS_CMD = _check_ghostscript()
 PRESETS: Dict[str, dict] = {
     # 均衡 —— 极限体积优先（视频 x265 + 降帧 + 低码率音频）
     "balanced": {
+        "super_dry": False,
         "image_quality": 75,
         "image_max_dim": 2560,
         "image_max_dpi": 150,       # 独立图片：超过此 DPI 则按比例缩小像素
@@ -111,6 +113,7 @@ PRESETS: Dict[str, dict] = {
     },
     # 激进 —— 最大压缩，画质次于 balanced
     "aggressive": {
+        "super_dry": False,
         "image_quality": 60,
         "image_max_dim": 1920,
         "image_max_dpi": 96,
@@ -126,6 +129,7 @@ PRESETS: Dict[str, dict] = {
     },
     # 高质量 —— 仍保持 x265，但给更低 CRF
     "high": {
+        "super_dry": False,
         "image_quality": 85,
         "image_max_dim": 4096,
         "image_max_dpi": 200,
@@ -160,6 +164,19 @@ CONTENT_TYPES = {
     ".tif":  "image/tiff",
     ".webp": "image/webp",
 }
+
+
+def _etag(el: ET.Element) -> str:
+    """返回 XML 标签的本地名（去命名空间前缀）。"""
+    tag = el.tag
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
+
+
+def _et_serialize(root: ET.Element) -> bytes:
+    """统一 XML 输出格式。"""
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -470,7 +487,6 @@ def _pptx_build_dpi_limit_map(all_entries: dict, max_dpi: int) -> Dict[str, int]
 
     914400 EMU = 1 英寸。
     """
-    import xml.etree.ElementTree as ET
     from posixpath import normpath, join, dirname
 
     EMU_PER_INCH = 914400
@@ -628,6 +644,125 @@ def _pptx_compress_image_entry(
     return best_name, best_data
 
 
+def _pptx_super_dry(all_entries: Dict[str, bytes]) -> None:
+    """
+    super_dry 模式：
+    - 删除 ppt/media 下所有多媒体文件（图片/音频/视频）
+    - 删除 slide rels 中所有 image/video/audio 关系
+    - 删除 slides xml 中引用这些 rId 的形状节点（pic/movie 等）
+    - 清理 [Content_Types].xml 中对应 media 的 Override
+    """
+    media_prefix = "ppt/media/"
+
+    # 1) 删除实际媒体二进制
+    media_keys = [
+        k for k in all_entries
+        if k.startswith(media_prefix) and Path(k).suffix.lower() in (IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS)
+    ]
+    for k in media_keys:
+        all_entries.pop(k, None)
+
+    # 2) 清理每页 rels，记录被删除的 rId
+    slide_removed_rids: Dict[str, set] = {}
+    rels_names = sorted(
+        n for n in all_entries
+        if n.startswith("ppt/slides/_rels/") and n.endswith(".xml.rels")
+    )
+    for rels_name in rels_names:
+        xml = all_entries.get(rels_name)
+        if not xml:
+            continue
+        try:
+            root = ET.fromstring(xml)
+        except Exception:
+            continue
+
+        removed = set()
+        for rel in list(root):
+            rtype = rel.get("Type", "")
+            target = rel.get("Target", "")
+            rid = rel.get("Id", "")
+            is_media_rel = (
+                ("/image" in rtype) or ("/video" in rtype) or ("/audio" in rtype)
+                or ("../media/" in target)
+            )
+            if not is_media_rel:
+                continue
+            root.remove(rel)
+            if rid:
+                removed.add(rid)
+
+        all_entries[rels_name] = _et_serialize(root)
+
+        slide_xml = rels_name.replace("/slides/_rels/", "/slides/").replace(".rels", "")
+        if removed:
+            slide_removed_rids[slide_xml] = removed
+
+    # 3) 清理 slide xml 中对这些 rId 的引用节点
+    for slide_xml, rid_set in slide_removed_rids.items():
+        xml = all_entries.get(slide_xml)
+        if not xml:
+            continue
+        try:
+            root = ET.fromstring(xml)
+        except Exception:
+            continue
+
+        parent_map = {c: p for p in root.iter() for c in p}
+        nodes_to_remove = []
+
+        for el in root.iter():
+            # 检查任意属性是否引用了待删 rId（尤其 r:embed / r:link）
+            hit = any(val in rid_set for val in el.attrib.values())
+            if not hit:
+                continue
+
+            # 往上找到可删除的形状容器（pic / graphicFrame / movie / obj）
+            node = el
+            for _ in range(12):
+                tag = _etag(node)
+                if tag in ("pic", "graphicFrame", "movie", "video", "audio", "obj"):
+                    nodes_to_remove.append(node)
+                    break
+                node = parent_map.get(node)
+                if node is None:
+                    break
+
+        # 去重并删除
+        seen = set()
+        for n in nodes_to_remove:
+            nid = id(n)
+            if nid in seen:
+                continue
+            seen.add(nid)
+            p = parent_map.get(n)
+            if p is not None:
+                try:
+                    p.remove(n)
+                except Exception:
+                    pass
+
+        all_entries[slide_xml] = _et_serialize(root)
+
+    # 4) 清理 [Content_Types].xml 里已删除 media 的 Override
+    ct_name = "[Content_Types].xml"
+    if ct_name in all_entries:
+        try:
+            root = ET.fromstring(all_entries[ct_name])
+            for ov in list(root):
+                if _etag(ov) != "Override":
+                    continue
+                part_name = ov.get("PartName", "")
+                if not part_name:
+                    continue
+                normalized = part_name.lstrip("/")
+                if normalized.startswith(media_prefix):
+                    root.remove(ov)
+            all_entries[ct_name] = _et_serialize(root)
+        except Exception:
+            pass
+
+
 def compress_pptx_file(src: Path, dst: Path, preset: dict) -> bool:
     """
     压缩 PPTX 文件内嵌的媒体（图片 + 视频）。
@@ -645,6 +780,15 @@ def compress_pptx_file(src: Path, dst: Path, preset: dict) -> bool:
         # 一次性读入全部内容避免上下文问题
         with zipfile.ZipFile(src, "r") as zin:
             all_entries = {name: zin.read(name) for name in zin.namelist()}
+
+        # super_dry：直接删除全部多媒体，只保留文本结构
+        if preset.get("super_dry", False):
+            _pptx_super_dry(all_entries)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zout:
+                for name, data in all_entries.items():
+                    zout.writestr(name, data)
+            return True
 
         # 预先建立 DPI 像素上限映射：媒体路径 → 最大像素长边
         dpi_limit_map: Dict[str, int] = {}
@@ -761,6 +905,45 @@ def compress_pptx_file(src: Path, dst: Path, preset: dict) -> bool:
 # ──────────────────────────────────────────────────────────────────
 # PDF 压缩
 # ──────────────────────────────────────────────────────────────────
+def _pdf_super_dry(src: Path, dst: Path) -> bool:
+    """
+    super_dry 模式：仅保留文本内容，删除图片/图形等多媒体。
+    实现方式：逐页提取纯文本，重建一个仅文本的新 PDF。
+    """
+    if not HAS_PYMUPDF:
+        print(f"\n    ✗ super_dry 处理 PDF 需要 PyMuPDF: {src.name}")
+        return False
+    try:
+        src_doc = fitz.open(str(src))
+        out_doc = fitz.open()
+
+        for page in src_doc:
+            rect = page.rect
+            new_page = out_doc.new_page(width=rect.width, height=rect.height)
+            text = page.get_text("text")
+            if not text.strip():
+                continue
+            margin = 36
+            box = fitz.Rect(margin, margin, rect.width - margin, rect.height - margin)
+            # 用内置字体写回文本
+            new_page.insert_textbox(
+                box,
+                text,
+                fontsize=10,
+                fontname="helv",
+                color=(0, 0, 0),
+                align=fitz.TEXT_ALIGN_LEFT,
+            )
+
+        out_doc.save(str(dst), garbage=4, deflate=True, clean=True)
+        out_doc.close()
+        src_doc.close()
+        return True
+    except Exception as e:
+        print(f"\n    ✗ PDF super_dry 失败 [{src.name}]: {e}")
+        return False
+
+
 def compress_pdf_file(src: Path, dst: Path, preset: dict) -> bool:
     """
     按优先级尝试各种 PDF 压缩方案。
@@ -769,6 +952,11 @@ def compress_pdf_file(src: Path, dst: Path, preset: dict) -> bool:
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
     src_size = src.stat().st_size
+
+    # super_dry：只保留文本，直接重建 PDF
+    if preset.get("super_dry", False):
+        ok = _pdf_super_dry(src, dst)
+        return ok
 
     if GS_CMD:
         ok = _compress_pdf_gs(src, dst, preset)
@@ -1186,6 +1374,8 @@ def main():
                         help="覆盖音频码率（如 128k、192k）")
     parser.add_argument("--quiet", action="store_true",
                         help="静默模式，不逐文件打印进度")
+    parser.add_argument("--super-dry", action="store_true",
+                        help="超级瘦身模式：PPTX/PDF 删除所有多媒体，仅保留文本")
 
     args = parser.parse_args()
     verbose = not args.quiet
@@ -1212,6 +1402,8 @@ def main():
     if args.audio_bitrate:
         preset["audio_bitrate"]       = args.audio_bitrate
         preset["video_audio_bitrate"] = args.audio_bitrate
+    if args.super_dry:
+        preset["super_dry"] = True
 
     # ── 打印配置
     if verbose:
@@ -1229,6 +1421,7 @@ def main():
         print(f"  图片质量：  {preset['image_quality']}%  最大边长：{preset['image_max_dim']}px  最大DPI：{dpi_show}")
         print(f"  视频编码：  {preset['video_codec']}  CRF：{preset['video_crf']}  FPS：<=24")
         print(f"  音频码率：  {preset['audio_bitrate']}  采样率：16kHz 单声道")
+        print(f"  super_dry： {'开启（PPTX/PDF 仅保留文本）' if preset.get('super_dry') else '关闭'}")
         print()
         print("  依赖状态：")
         print(f"    Pillow      {'✓' if HAS_PILLOW else '✗  pip install Pillow'}")
