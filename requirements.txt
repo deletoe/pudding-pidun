@@ -1,0 +1,28 @@
+# 媒体文件有损压缩工具 - Python 依赖
+# 安装命令：pip install -r requirements.txt
+
+# 图片处理（必需）
+Pillow>=10.0.0
+
+# PDF 图片替换压缩（推荐）
+pikepdf>=8.0.0
+
+# PDF 结构优化（推荐）
+PyMuPDF>=1.23.0
+
+# PPT/PPTX 处理（用于导入验证，可选）
+python-pptx>=0.6.21
+
+# ──────────────────────────────────────────────
+# 外部工具（需单独安装，非 pip）：
+#
+#  ffmpeg  —— 音频/视频压缩（必需以处理音视频）
+#    Windows: https://ffmpeg.org/download.html
+#    macOS:   brew install ffmpeg
+#    Linux:   sudo apt install ffmpeg
+#
+#  Ghostscript —— PDF 图片深度压缩（可选，效果最好）
+#    Windows: https://ghostscript.com/releases/gsdnld.html
+#    macOS:   brew install ghostscript
+#    Linux:   sudo apt install ghostscript
+# ──────────────────────────────────────────────
