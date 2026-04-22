@@ -12,8 +12,8 @@
 |------|--------|----------|
 | 图片 | `.jpg` `.png` `.gif` `.bmp` `.tiff` `.webp` | 转换为 JPEG，超长边等比缩放 |
 | 音频 | `.mp3` `.wav` `.flac` `.ogg` `.m4a` `.aac` `.wma` `.opus` | 重编码为 AAC |
-| 视频 | `.mp4` `.mov` `.avi` `.mkv` `.wmv` `.flv` `.webm` | 重编码为 H.264 MP4 |
-| 演示文稿 | `.pptx` | 压缩内部嵌入图片，保持幻灯片尺寸不变 |
+| 视频 | `.mp4` `.mov` `.avi` `.mkv` `.wmv` `.flv` `.webm` | 重编码为 x265 MP4（≤24fps） |
+| 演示文稿 | `.pptx` | 压缩内部嵌入图片/视频，保持幻灯片尺寸不变 |
 | PDF | `.pdf` | 重压缩嵌入图片（需 Ghostscript 或 pikepdf） |
 | Photoshop | `.psd` | 合并图层后转为 JPEG |
 | Illustrator | `.ai` | 作为 PDF 解析压缩（适用于 CS 及以后版本） |
@@ -27,8 +27,8 @@
 ### 1. 克隆 / 下载项目
 
 ```bash
-git clone <repo-url>
-cd budingyamianbao
+git clone https://github.com/deletoe/pudding-pidun
+cd pudding-pidun
 ```
 
 ### 2. 创建虚拟环境并安装 Python 依赖
@@ -88,6 +88,9 @@ python compress_media.py 素材/ -q 80 --max-dim 2048 --max-dpi 150 --crf 25 --a
 
 # 静默模式（不逐文件打印进度）
 python compress_media.py 素材/ --quiet
+
+# super-dry：PPT/PDF 删除全部多媒体，仅保留文本
+python compress_media.py 素材/ --super-dry
 ```
 
 ### 全部参数
@@ -104,6 +107,7 @@ python compress_media.py 素材/ --quiet
 | `--crf` | 视频 CRF 值（0–51，越小越好） | 由预设决定 |
 | `--audio-bitrate` | 音频码率（如 `128k`、`192k`） | 由预设决定 |
 | `--quiet` | 静默模式 | 关闭 |
+| `--super-dry` | 超级瘦身模式：PPTX/PDF 删除所有多媒体，仅保留文本 | 关闭 |
 
 ---
 
@@ -156,3 +160,5 @@ python compress_media.py 素材/ --quiet
 - 旧版二进制 `.ppt` 格式（PowerPoint 97–2003）暂不支持内部压缩，会直接复制原件。
 - AI 文件仅支持 Adobe Illustrator CS（2003）及以后基于 PDF 的格式；更早的 PostScript 格式无法处理。
 - 若压缩后文件反而变大，脚本会自动保留原始文件。
+- `--super-dry` 仅对 `.pptx` 与 `.pdf` 生效：会删除图片/音频/视频等多媒体，只保留文本内容。
+- `--super-dry` 的 PDF 为文本重排版本（基于提取后回写），不保证原始版式、字体、换行位置完全一致。
