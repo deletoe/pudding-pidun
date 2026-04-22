@@ -83,8 +83,8 @@ python compress_media.py 素材/ --inplace
 # 使用激进压缩预设
 python compress_media.py 素材/ --preset aggressive
 
-# 自定义参数
-python compress_media.py 素材/ -q 80 --max-dim 2048 --crf 25 --audio-bitrate 96k
+# 自定义参数（含 DPI 限制）
+python compress_media.py 素材/ -q 80 --max-dim 2048 --max-dpi 150 --crf 25 --audio-bitrate 96k
 
 # 静默模式（不逐文件打印进度）
 python compress_media.py 素材/ --quiet
@@ -99,7 +99,8 @@ python compress_media.py 素材/ --quiet
 | `-p, --preset` | 压缩预设：`balanced` / `aggressive` / `high` | `balanced` |
 | `--inplace` | 原地压缩，替换原文件 | 关闭 |
 | `-q, --quality` | 图片 JPEG 质量（1–95） | 由预设决定 |
-| `--max-dim` | 图片最大边长（像素） | 由预设决定 |
+| `--max-dim` | 图片/文档内图片的像素长边硬性上限 | 由预设决定 |
+| `--max-dpi` | 最大 DPI（与 `--max-dim` 共同约束像素数，取较小值） | 由预设决定 |
 | `--crf` | 视频 CRF 值（0–51，越小越好） | 由预设决定 |
 | `--audio-bitrate` | 音频码率（如 `128k`、`192k`） | 由预设决定 |
 | `--quiet` | 静默模式 | 关闭 |
@@ -108,13 +109,28 @@ python compress_media.py 素材/ --quiet
 
 ## 压缩预设
 
-| 预设 | 图片质量 | 图片最大边长 | 视频 CRF | 视频最大分辨率 | 音频码率 |
-|------|----------|--------------|----------|----------------|----------|
-| `balanced`（默认） | 75% | 2560 px | 23 | 1920×1080 | 128 kbps |
-| `aggressive` | 60% | 1920 px | 28 | 1280×720 | 96 kbps |
-| `high` | 85% | 4096 px | 20 | 3840×2160 | 192 kbps |
+| 预设 | 图片质量 | 最大边长 | 最大 DPI | 视频 CRF | 视频最大分辨率 | 音频码率 |
+|------|----------|----------|----------|----------|----------------|----------|
+| `balanced`（默认） | 75% | 2560 px | 150 | 23 | 1920×1080 | 128 kbps |
+| `aggressive` | 60% | 1920 px | 96 | 28 | 1280×720 | 96 kbps |
+| `high` | 85% | 4096 px | 200 | 20 | 3840×2160 | 192 kbps |
 
 `balanced` 预设下，大多数图片/视频**肉眼感知不到质量损失**，体积可减少 40%–70%。
+
+### `--max-dpi` 与 `--max-dim` 的关系
+
+两个参数同时生效，脚本取**更严格**（更小）的一侧作为实际像素约束：
+
+```
+实际像素长边 = min(max-dim, 显示尺寸(英寸) × max-dpi)
+```
+
+| 场景 | 生效逻辑 |
+|------|----------|
+| 独立图片（有 DPI 元数据） | 按 `当前DPI > max-dpi` 时等比缩小像素，再受 `max-dim` 限制 |
+| PPTX 内嵌图片 | 解析幻灯片 XML 获取真实显示尺寸（EMU），精确计算每张图片的像素上限 |
+| PDF（Ghostscript） | 直接传入 `-dColorImageResolution` 参数，由 GS 精确控制 |
+| PDF（pikepdf） | 以页面物理尺寸（MediaBox）作为图片最大显示面积的保守估算 |
 
 ---
 
