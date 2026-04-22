@@ -174,9 +174,103 @@ def _etag(el: ET.Element) -> str:
     return tag
 
 
+def _et_register_ns_from_bytes(xml_bytes: bytes) -> None:
+    """
+    扫描 XML 头部所有 xmlns 声明并注册到 ET，
+    确保 ET.fromstring + ET.tostring 往返时保留原始命名空间前缀
+    （如 p: a: r: 不会被改写为 ns0: ns1:）。
+    """
+    snippet = xml_bytes[:8192].decode("utf-8", errors="replace")
+    for prefix, uri in re.findall(r'xmlns:?(\w*)="([^"]+)"', snippet):
+        try:
+            ET.register_namespace(prefix or "", uri)
+        except Exception:
+            pass
+
+
 def _et_serialize(root: ET.Element) -> bytes:
-    """统一 XML 输出格式。"""
+    """统一 XML 输出格式（调用前需先调用 _et_register_ns_from_bytes 保留命名空间）。"""
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _rels_remove_media_rels(xml_bytes: bytes) -> Tuple[bytes, set]:
+    """
+    用字符串替换（而非 ET 序列化）从 rels 文件中删除 image/video/audio 关系。
+    避免 ET 改写命名空间前缀导致 PowerPoint 打开提示修复。
+    返回 (新 bytes, 被删除的 rId 集合)。
+    """
+    text = xml_bytes.decode("utf-8", errors="replace")
+    removed: set = set()
+
+    def _replacer(m: re.Match) -> str:
+        s = m.group(0)
+        t_m   = re.search(r'\bType="([^"]+)"',   s)
+        tgt_m = re.search(r'\bTarget="([^"]+)"', s)
+        rid_m = re.search(r'\bId="([^"]+)"',     s)
+        t   = t_m.group(1)   if t_m   else ""
+        tgt = tgt_m.group(1) if tgt_m else ""
+        if ("/image" in t or "/video" in t or "/audio" in t or "../media/" in tgt):
+            if rid_m:
+                removed.add(rid_m.group(1))
+            return ""
+        return s
+
+    new_text = re.sub(r'[ \t]*<Relationship\b[^>]*/>\r?\n?', _replacer, text)
+    return new_text.encode("utf-8"), removed
+
+
+def _pptx_fix_content_types(all_entries: Dict[str, bytes], name_map: Dict[str, str]) -> None:
+    """
+    正确更新 [Content_Types].xml 中因媒体文件重命名（如 .png→.jpg）引起的变化。
+
+    策略（全部基于字符串替换，不经过 ET，避免命名空间前缀被改写）：
+      1. Override PartName 里的文件名做字符串替换
+      2. 若引入了新扩展名，在 </Types> 前追加 Default 条目
+      3. 不修改现有 Default 条目——避免破坏仍以旧扩展名存在的文件
+    """
+    ct_name = "[Content_Types].xml"
+    if ct_name not in all_entries:
+        return
+
+    base_name_map = {
+        Path(old).name: Path(new).name
+        for old, new in name_map.items()
+        if old != new
+    }
+    if not base_name_map:
+        return
+
+    ct_text = all_entries[ct_name].decode("utf-8", errors="replace")
+    changed = False
+
+    # 1. 替换 Override/Default PartName 里的文件名（仅文件名部分，精确）
+    for old_base, new_base in base_name_map.items():
+        if old_base in ct_text:
+            ct_text = ct_text.replace(old_base, new_base)
+            changed = True
+
+    # 2. 新扩展名若尚无 Default 条目则追加（不改动已有条目）
+    introduced_new_exts: set = set()
+    for old, new in name_map.items():
+        if old == new:
+            continue
+        old_e = Path(old).suffix.lower()
+        new_e = Path(new).suffix.lower()
+        if old_e != new_e:
+            introduced_new_exts.add(new_e)
+
+    for ext in introduced_new_exts:
+        ext_bare = ext.lstrip(".")
+        ct_for_ext = CONTENT_TYPES.get(ext)
+        if not ct_for_ext:
+            continue
+        if f'Extension="{ext_bare}"' not in ct_text:
+            tag = f'<Default Extension="{ext_bare}" ContentType="{ct_for_ext}"/>'
+            ct_text = ct_text.replace("</Types>", f"  {tag}\n</Types>")
+            changed = True
+
+    if changed:
+        all_entries[ct_name] = ct_text.encode("utf-8")
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -592,15 +686,15 @@ def _pptx_compress_image_entry(
     dpi_limit: Optional[int] = None,
 ) -> Tuple[str, bytes]:
     """
-    对 PPTX/ZIP 内单张图片进行压缩（格式自适应）。
-
-    目标：在 PPT 可稳定支持的格式内（JPEG/PNG）选体积最小方案，
-    并确保不比原图更大。
+    对 PPTX/ZIP 内单张图片进行压缩（格式自适应，允许 PNG→JPG 跨格式转换）。
 
     策略：
       1) 先按 max_dim 与 dpi_limit 做等比缩放
       2) 生成 JPEG 与 PNG 两个候选（带透明通道时仅 PNG）
       3) 与原始数据比较，选最小者
+
+    注意：文件名/扩展名可能改变（如 image1.png → image1.jpg），
+    调用方需负责更新 rels 引用和 [Content_Types].xml（通过 _pptx_fix_content_types）。
 
     返回 (新文件名, 新字节数据)
     """
@@ -628,11 +722,10 @@ def _pptx_compress_image_entry(
     # JPEG 候选（无透明时）
     if not alpha:
         jpg_buf = io.BytesIO()
-        img_rgb = _to_rgb(img)
-        img_rgb.save(jpg_buf, "JPEG", quality=quality, optimize=True, progressive=True)
+        _to_rgb(img).save(jpg_buf, "JPEG", quality=quality, optimize=True, progressive=True)
         candidates.append((str(Path(name).with_suffix(".jpg")), jpg_buf.getvalue()))
 
-    # 选择最小体积候选；若并列，优先保留原文件名
+    # 选择最小体积候选；体积相同时优先保留原文件名（不改扩展名）
     best_name, best_data = min(
         candidates,
         key=lambda it: (len(it[1]), 0 if it[0] == name else 1),
@@ -644,123 +737,98 @@ def _pptx_compress_image_entry(
     return best_name, best_data
 
 
+def _pptx_make_media_placeholder(ext: str) -> bytes:
+    """为 PPTX media 条目构造最小占位内容，保持扩展名不变。"""
+    ext = ext.lower()
+
+    if HAS_PILLOW and ext in IMAGE_EXTS:
+        rgb = Image.new("RGB", (1, 1), (255, 255, 255))
+        rgba = Image.new("RGBA", (1, 1), (0, 0, 0, 0))  # 全透明
+        buf = io.BytesIO()
+
+        if ext in (".jpg", ".jpeg"):
+            # JPEG 不支持透明，保留最小白图占位
+            rgb.save(buf, "JPEG", quality=40, optimize=True)
+        elif ext == ".png":
+            rgba.save(buf, "PNG", optimize=True)
+        elif ext == ".gif":
+            # GIF 使用透明调色板索引
+            gif = rgba.convert("P", palette=Image.ADAPTIVE)
+            gif.info["transparency"] = 0
+            gif.save(buf, "GIF", transparency=0)
+        elif ext in (".bmp",):
+            # BMP 兼容性优先，不使用透明
+            rgb.save(buf, "BMP")
+        elif ext in (".tif", ".tiff"):
+            rgba.save(buf, "TIFF", compression="tiff_lzw")
+        elif ext == ".webp":
+            rgba.save(buf, "WEBP", quality=20, method=6)
+        else:
+            rgba.save(buf, "PNG", optimize=True)
+
+        return buf.getvalue()
+
+    # 音视频占位：保留一个极小字节，确保 zip entry 存在
+    # （super_dry 目标是最大压缩与可打开，不保证媒体可播放）
+    return b"0"
+
+
 def _pptx_super_dry(all_entries: Dict[str, bytes]) -> None:
     """
-    super_dry 模式：
-    - 删除 ppt/media 下所有多媒体文件（图片/音频/视频）
-    - 删除 slide rels 中所有 image/video/audio 关系
-    - 删除 slides xml 中引用这些 rId 的形状节点（pic/movie 等）
-    - 清理 [Content_Types].xml 中对应 media 的 Override
+    super_dry 模式（重写版）：
+    - 保留 XML / rels 结构
+    - 将 ppt/media/* 媒体替换为最小占位内容
+    - 对 .jpg/.jpeg/.bmp 额外转为 .png 透明占位，并同步更新引用
     """
-    media_prefix = "ppt/media/"
+    # old media path -> new media path（仅扩展名发生变化时记录）
+    name_map: Dict[str, str] = {}
 
-    # 1) 删除实际媒体二进制
-    media_keys = [
-        k for k in all_entries
-        if k.startswith(media_prefix) and Path(k).suffix.lower() in (IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS)
-    ]
-    for k in media_keys:
-        all_entries.pop(k, None)
-
-    # 2) 清理每页 rels，记录被删除的 rId
-    slide_removed_rids: Dict[str, set] = {}
-    rels_names = sorted(
-        n for n in all_entries
-        if n.startswith("ppt/slides/_rels/") and n.endswith(".xml.rels")
-    )
-    for rels_name in rels_names:
-        xml = all_entries.get(rels_name)
-        if not xml:
+    for name in list(all_entries.keys()):
+        if not name.startswith("ppt/media/"):
             continue
-        try:
-            root = ET.fromstring(xml)
-        except Exception:
+        ext = Path(name).suffix.lower()
+        if ext not in (IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS):
             continue
 
-        removed = set()
-        for rel in list(root):
-            rtype = rel.get("Type", "")
-            target = rel.get("Target", "")
-            rid = rel.get("Id", "")
-            is_media_rel = (
-                ("/image" in rtype) or ("/video" in rtype) or ("/audio" in rtype)
-                or ("../media/" in target)
-            )
-            if not is_media_rel:
+        # 将 jpg/jpeg/bmp 转成 png 透明占位
+        if ext in (".jpg", ".jpeg", ".bmp"):
+            cand = str(Path(name).with_suffix(".png")).replace("\\", "/")
+            if cand in all_entries and cand != name:
+                # 避免名称冲突：追加后缀
+                p = Path(name)
+                cand = str(p.with_name(p.stem + "_superdry.png")).replace("\\", "/")
+            all_entries.pop(name, None)
+            all_entries[cand] = _pptx_make_media_placeholder(".png")
+            name_map[name] = cand
+        else:
+            all_entries[name] = _pptx_make_media_placeholder(ext)
+
+    # 同步更新 XML/rels 中文件名引用
+    if name_map:
+        base_name_map = {
+            Path(old).name: Path(new).name
+            for old, new in name_map.items()
+            if old != new
+        }
+        for entry_name, data in list(all_entries.items()):
+            if not (entry_name.endswith(".xml") or entry_name.endswith(".rels")):
                 continue
-            root.remove(rel)
-            if rid:
-                removed.add(rid)
-
-        all_entries[rels_name] = _et_serialize(root)
-
-        slide_xml = rels_name.replace("/slides/_rels/", "/slides/").replace(".rels", "")
-        if removed:
-            slide_removed_rids[slide_xml] = removed
-
-    # 3) 清理 slide xml 中对这些 rId 的引用节点
-    for slide_xml, rid_set in slide_removed_rids.items():
-        xml = all_entries.get(slide_xml)
-        if not xml:
-            continue
-        try:
-            root = ET.fromstring(xml)
-        except Exception:
-            continue
-
-        parent_map = {c: p for p in root.iter() for c in p}
-        nodes_to_remove = []
-
-        for el in root.iter():
-            # 检查任意属性是否引用了待删 rId（尤其 r:embed / r:link）
-            hit = any(val in rid_set for val in el.attrib.values())
-            if not hit:
+            if entry_name == "[Content_Types].xml":
                 continue
-
-            # 往上找到可删除的形状容器（pic / graphicFrame / movie / obj）
-            node = el
-            for _ in range(12):
-                tag = _etag(node)
-                if tag in ("pic", "graphicFrame", "movie", "video", "audio", "obj"):
-                    nodes_to_remove.append(node)
-                    break
-                node = parent_map.get(node)
-                if node is None:
-                    break
-
-        # 去重并删除
-        seen = set()
-        for n in nodes_to_remove:
-            nid = id(n)
-            if nid in seen:
+            try:
+                text = data.decode("utf-8")
+            except Exception:
                 continue
-            seen.add(nid)
-            p = parent_map.get(n)
-            if p is not None:
-                try:
-                    p.remove(n)
-                except Exception:
-                    pass
+            changed = False
+            for old_base, new_base in base_name_map.items():
+                if old_base in text:
+                    text = text.replace(old_base, new_base)
+                    changed = True
+            if changed:
+                all_entries[entry_name] = text.encode("utf-8")
 
-        all_entries[slide_xml] = _et_serialize(root)
-
-    # 4) 清理 [Content_Types].xml 里已删除 media 的 Override
-    ct_name = "[Content_Types].xml"
-    if ct_name in all_entries:
-        try:
-            root = ET.fromstring(all_entries[ct_name])
-            for ov in list(root):
-                if _etag(ov) != "Override":
-                    continue
-                part_name = ov.get("PartName", "")
-                if not part_name:
-                    continue
-                normalized = part_name.lstrip("/")
-                if normalized.startswith(media_prefix):
-                    root.remove(ov)
-            all_entries[ct_name] = _et_serialize(root)
-        except Exception:
-            pass
+        # 同步 [Content_Types].xml
+        _pptx_fix_content_types(all_entries, name_map)
 
 
 def compress_pptx_file(src: Path, dst: Path, preset: dict) -> bool:
@@ -848,30 +916,28 @@ def compress_pptx_file(src: Path, dst: Path, preset: dict) -> bool:
                 print(f"\n      跳过图片 [{name}]: {e}")
 
         # 更新所有 XML / rels 文件中的文件名引用
+        # [Content_Types].xml 由专用函数处理（字符串替换，不经 ET 序列化）
+        _pptx_fix_content_types(all_entries, name_map)
+
+        base_name_map = {
+            Path(old).name: Path(new).name
+            for old, new in name_map.items()
+            if old != new
+        }
+
         updated_texts: Dict[str, bytes] = {}
         for name, data in all_entries.items():
             if not (name.endswith(".xml") or name.endswith(".rels")):
                 continue
+            if name == "[Content_Types].xml":
+                continue  # 已由 _pptx_fix_content_types 处理
             try:
                 text = data.decode("utf-8")
                 changed = False
-                for old, new in name_map.items():
-                    if old == new:
-                        continue
-                    old_base = Path(old).name
-                    new_base = Path(new).name
+                for old_base, new_base in base_name_map.items():
                     if old_base in text:
                         text = text.replace(old_base, new_base)
                         changed = True
-                    # Content_Types.xml 中同时需要更新 ContentType 属性
-                    if name == "[Content_Types].xml" and changed:
-                        old_ct = CONTENT_TYPES.get(Path(old).suffix.lower(), "")
-                        new_ct = CONTENT_TYPES.get(Path(new).suffix.lower(), "")
-                        if old_ct and new_ct and old_ct != new_ct:
-                            text = text.replace(
-                                f'ContentType="{old_ct}"',
-                                f'ContentType="{new_ct}"',
-                            )
                 if changed:
                     updated_texts[name] = text.encode("utf-8")
             except Exception:
@@ -907,39 +973,98 @@ def compress_pptx_file(src: Path, dst: Path, preset: dict) -> bool:
 # ──────────────────────────────────────────────────────────────────
 def _pdf_super_dry(src: Path, dst: Path) -> bool:
     """
-    super_dry 模式：仅保留文本内容，删除图片/图形等多媒体。
-    实现方式：逐页提取纯文本，重建一个仅文本的新 PDF。
+    super_dry 模式：保留 PDF 文本层，移除图片等多媒体，尽量不重排文本。
+
+    策略：
+      1) 用 pikepdf 删除每页 /XObject 中的 /Image（及其绘制指令）
+      2) 保留页面内容流里的文本对象（BT/ET）
+      3) 再用 PyMuPDF 做垃圾清理保存
+
+    这样比“提取文本后重建 PDF”更不容易出现乱码。
     """
-    if not HAS_PYMUPDF:
-        print(f"\n    ✗ super_dry 处理 PDF 需要 PyMuPDF: {src.name}")
+    if not HAS_PIKEPDF:
+        print(f"\n    ✗ super_dry 处理 PDF 需要 pikepdf: {src.name}")
         return False
+
+    tmp_path = dst.with_suffix(".superdry.tmp.pdf")
+
     try:
-        src_doc = fitz.open(str(src))
-        out_doc = fitz.open()
+        pdf = pikepdf.open(str(src))
 
-        for page in src_doc:
-            rect = page.rect
-            new_page = out_doc.new_page(width=rect.width, height=rect.height)
-            text = page.get_text("text")
-            if not text.strip():
+        for page in pdf.pages:
+            resources = page.get("/Resources")
+            if not resources:
                 continue
-            margin = 36
-            box = fitz.Rect(margin, margin, rect.width - margin, rect.height - margin)
-            # 用内置字体写回文本
-            new_page.insert_textbox(
-                box,
-                text,
-                fontsize=10,
-                fontname="helv",
-                color=(0, 0, 0),
-                align=fitz.TEXT_ALIGN_LEFT,
-            )
 
-        out_doc.save(str(dst), garbage=4, deflate=True, clean=True)
-        out_doc.close()
-        src_doc.close()
+            xobj = resources.get("/XObject")
+            if not xobj:
+                continue
+
+            image_names = []
+            for key in list(xobj.keys()):
+                try:
+                    obj = xobj[key]
+                    if obj.get("/Subtype") == pikepdf.Name("/Image"):
+                        image_names.append(str(key))
+                except Exception:
+                    continue
+
+            if not image_names:
+                continue
+
+            # 1) 从资源字典移除图片 XObject
+            for key in list(xobj.keys()):
+                if str(key) in image_names:
+                    try:
+                        del xobj[key]
+                    except Exception:
+                        pass
+
+            # 2) 从内容流移除对这些图片的 Do 指令
+            #    常见形式：/Im1 Do
+            try:
+                contents = page.get("/Contents")
+                if contents is not None:
+                    streams = []
+                    if isinstance(contents, pikepdf.Array):
+                        streams = list(contents)
+                    else:
+                        streams = [contents]
+
+                    for st in streams:
+                        try:
+                            raw = bytes(st.read_bytes())
+                            txt = raw.decode("latin-1", errors="ignore")
+                            for nm in image_names:
+                                txt = re.sub(r"/" + re.escape(nm.lstrip("/")) + r"\s+Do", "", txt)
+                            st.write(txt.encode("latin-1"))
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+        pdf.save(
+            str(tmp_path),
+            compress_streams=True,
+            object_stream_mode=pikepdf.ObjectStreamMode.generate,
+        )
+        pdf.close()
+
+        # 3) 再做一次结构清理
+        if HAS_PYMUPDF:
+            doc = fitz.open(str(tmp_path))
+            doc.save(str(dst), garbage=4, deflate=True, clean=True)
+            doc.close()
+            tmp_path.unlink(missing_ok=True)
+        else:
+            shutil.move(str(tmp_path), str(dst))
+
         return True
     except Exception as e:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         print(f"\n    ✗ PDF super_dry 失败 [{src.name}]: {e}")
         return False
 
