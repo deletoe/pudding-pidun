@@ -56,7 +56,8 @@ def _compress_video_in_memory(src: Path, dst: Path, preset: dict) -> bool:
         "-vf", f"{scale_filter},fps={target_fps:.3f}",
         "-c:a", "aac",
         "-b:a", preset["video_audio_bitrate"],
-        "-ar", "16000",
+        "-ar", "12000",
+        "-ac", "1",
         "-movflags", "+faststart",
     ]
     if preset.get("video_codec") == "libx265":
@@ -92,7 +93,8 @@ def compress_video_file(src: Path, dst: Path, preset: dict) -> Optional[Path]:
         "-vf", f"{scale_filter},fps={target_fps:.3f}",
         "-c:a", "aac",
         "-b:a", preset["video_audio_bitrate"],
-        "-ar", "16000",
+        "-ar", "12000",
+        "-ac", "1",
         "-movflags", "+faststart",
     ]
     if preset.get("video_codec") == "libx265":

@@ -15,7 +15,7 @@ def compress_audio_file(src: Path, dst: Path, preset: dict) -> Optional[Path]:
         "ffmpeg", "-y", "-i", str(src),
         "-c:a", preset["audio_codec"],
         "-b:a", preset["audio_bitrate"],
-        "-ar", "16000",
+        "-ar", "12000",
         "-ac", "1",
         str(out_path),
     ]

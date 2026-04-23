@@ -17,9 +17,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 预设说明：
-  balanced   极限体积（默认） 图片 75%/2560px  视频 x265 CRF34 + FPS<=24  音频 8k
-  aggressive 更小体积         图片 60%/1920px  视频 x265 CRF38 + FPS<=24  音频 8k
-  high       质量优先         图片 85%/4096px  视频 x265 CRF30 + FPS<=24  音频 8k
+  balanced   极限体积（默认） 图片 75%/2560px  视频 x265 CRF34 + FPS<=24  音频 24k
+  aggressive 更小体积         图片 60%/1920px  视频 x265 CRF38 + FPS<=24  音频 16k
+  high       质量优先         图片 85%/4096px  视频 x265 CRF30 + FPS<=24  音频 32k
 
 示例：
   python compress_media.py 素材/
@@ -93,7 +93,7 @@ def main():
         dpi_show = str(preset.get("doc_max_dpi", "—"))
         print(f"  图片质量：  {preset['image_quality']}%  最大边长：{preset['image_max_dim']}px  最大DPI：{dpi_show}")
         print(f"  视频编码：  {preset['video_codec']}  CRF：{preset['video_crf']}  FPS：<=24")
-        print(f"  音频码率：  {preset['audio_bitrate']}  采样率：16kHz 单声道")
+        print(f"  音频码率：  {preset['audio_bitrate']}  采样率：12kHz 单声道")
         print(f"  super_dry： {'开启（PPTX/PDF 仅保留文本）' if preset.get('super_dry') else '关闭'}")
         print()
         print("  依赖状态：")
