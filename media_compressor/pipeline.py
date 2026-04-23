@@ -7,6 +7,7 @@ from .constants import AUDIO_EXTS, IMAGE_EXTS, VIDEO_EXTS
 from .processors.ai import compress_ai_file
 from .processors.audio import compress_audio_file
 from .processors.image import compress_image_file
+from .processors.keynote import compress_keynote_file
 from .processors.pdf import compress_pdf_file
 from .processors.pptx import compress_pptx_file
 from .processors.psd import compress_psd_file
@@ -16,12 +17,27 @@ from .stats import Stats, fmt_size
 
 def _fallback_copy(src: Path, dst: Path):
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    if src.is_dir():
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+    else:
+        shutil.copy2(src, dst)
+
+
+def _path_total_size(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            total += child.stat().st_size
+    return total
 
 
 def process_file(src: Path, dst: Path, preset: dict, stats: Stats, verbose: bool):
     ext = src.suffix.lower()
-    orig_size = src.stat().st_size
+    orig_size = _path_total_size(src)
 
     if verbose:
         print(f"  {src.name}  ({fmt_size(orig_size)})", end="", flush=True)
@@ -54,6 +70,10 @@ def process_file(src: Path, dst: Path, preset: dict, stats: Stats, verbose: bool
 
     elif ext == ".pdf":
         success = compress_pdf_file(src, dst, preset)
+        result_path = dst if success else None
+
+    elif ext == ".key":
+        success = compress_keynote_file(src, dst, preset)
         result_path = dst if success else None
 
     elif ext == ".psd":
@@ -90,7 +110,9 @@ def process_folder(src: Path, dst: Path, preset: dict, stats: Stats, verbose: bo
             continue
         if item.is_symlink():
             continue
-        if item.is_dir():
+        if item.is_dir() and item.suffix.lower() == ".key":
+            process_file(item, dst / item.name, preset, stats, verbose)
+        elif item.is_dir():
             process_folder(item, dst / item.name, preset, stats, verbose)
         elif item.is_file():
             process_file(item, dst / item.name, preset, stats, verbose)

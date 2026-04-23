@@ -51,7 +51,7 @@ PRESETS: Dict[str, dict] = {
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp"}
 AUDIO_EXTS = {".mp3", ".aac", ".m4a", ".wav", ".flac", ".ogg", ".opus", ".wma"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".3gp"}
-DOC_EXTS = {".pptx", ".ppt", ".pdf", ".psd", ".ai"}
+DOC_EXTS = {".pptx", ".ppt", ".pdf", ".psd", ".ai", ".key"}
 
 CONTENT_TYPES = {
     ".jpg": "image/jpeg",

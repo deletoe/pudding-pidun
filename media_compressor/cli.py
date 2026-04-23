@@ -12,7 +12,7 @@ def main():
     parser = argparse.ArgumentParser(
         prog="compress_media",
         description="媒体文件有损压缩工具 v1.0\n\n"
-        "对文件夹内所有图片/音频/视频及 PPTX/PDF/PSD/AI 中的嵌入媒体\n"
+        "对文件夹内所有图片/音频/视频及 PPTX/PDF/PSD/AI/Keynote(.key) 中的嵌入媒体\n"
         "进行有损压缩，在尽量不影响观感的前提下减小文件体积。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -51,7 +51,7 @@ def main():
     parser.add_argument("--crf", type=int, metavar="0-51", help="覆盖视频 CRF 值（越小越好，推荐 18-28）")
     parser.add_argument("--audio-bitrate", metavar="RATE", help="覆盖音频码率（如 128k、192k）")
     parser.add_argument("--quiet", action="store_true", help="静默模式，不逐文件打印进度")
-    parser.add_argument("--super-dry", action="store_true", help="超级瘦身模式：PPTX/PDF 删除所有多媒体，仅保留文本")
+    parser.add_argument("--super-dry", action="store_true", help="超级瘦身模式：PPTX/PDF/Keynote(.key) 替换多媒体为占位内容")
 
     args = parser.parse_args()
     verbose = not args.quiet
@@ -94,7 +94,7 @@ def main():
         print(f"  图片质量：  {preset['image_quality']}%  最大边长：{preset['image_max_dim']}px  最大DPI：{dpi_show}")
         print(f"  视频编码：  {preset['video_codec']}  CRF：{preset['video_crf']}  FPS：<=24")
         print(f"  音频码率：  {preset['audio_bitrate']}  采样率：12kHz 单声道")
-        print(f"  super_dry： {'开启（PPTX/PDF 仅保留文本）' if preset.get('super_dry') else '关闭'}")
+        print(f"  super_dry： {'开启（PPTX/PDF/Keynote 使用占位媒体）' if preset.get('super_dry') else '关闭'}")
         print()
         print("  依赖状态：")
         print(f"    Pillow      {'✓' if HAS_PILLOW else '✗  pip install Pillow'}")
