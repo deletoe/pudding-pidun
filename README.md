@@ -14,6 +14,7 @@
 | 音频 | `.mp3` `.wav` `.flac` `.ogg` `.m4a` `.aac` `.wma` `.opus` | 重编码为 AAC |
 | 视频 | `.mp4` `.mov` `.avi` `.mkv` `.wmv` `.flv` `.webm` | 重编码为 x265 MP4（≤24fps） |
 | 演示文稿 | `.pptx` | 压缩内部嵌入图片/视频，保持幻灯片尺寸不变 |
+| Keynote | `.key` | 压缩内部嵌入图片/视频/音频，保持幻灯片结构不变 |
 | PDF | `.pdf` | 重压缩嵌入图片（需 Ghostscript 或 pikepdf） |
 | Photoshop | `.psd` | 合并图层后转为 JPEG |
 | Illustrator | `.ai` | 作为 PDF 解析压缩（适用于 CS 及以后版本） |
@@ -160,5 +161,7 @@ python compress_media.py 素材/ --super-dry
 - 旧版二进制 `.ppt` 格式（PowerPoint 97–2003）暂不支持内部压缩，会直接复制原件。
 - AI 文件仅支持 Adobe Illustrator CS（2003）及以后基于 PDF 的格式；更早的 PostScript 格式无法处理。
 - 若压缩后文件反而变大，脚本会自动保留原始文件。
-- `--super-dry` 仅对 `.pptx` 与 `.pdf` 生效：会删除图片/音频/视频等多媒体，只保留文本内容。
+- `--super-dry` 仅对 `.pptx`、`.key` 与 `.pdf` 生效：会删除图片/音频/视频等多媒体，只保留文本内容。
 - `--super-dry` 的 PDF 为文本重排版本（基于提取后回写），不保证原始版式、字体、换行位置完全一致。
+- Keynote（`.key`）文件以 ZIP 归档格式存储，压缩时保持 `STORED`（无压缩）方式以兼容 Keynote 应用。
+- Keynote 中的媒体文件（图片/视频/音频）会被单独压缩，但幻灯片结构（`.iwa` 文件）保持不变。
