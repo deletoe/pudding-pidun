@@ -30,22 +30,41 @@ def _compress_key_image_bytes(data: bytes, ext: str, preset: dict) -> Optional[b
 
     img = Image.open(io.BytesIO(data))
     img.load()
+
+    # 使用文件实际格式（magic bytes 决定），而非扩展名
+    # 避免 PNG 存为 .jpg 或 JPEG 存为 .png 时格式被错误转换
+    actual_format = (img.format or "").upper()
+    if actual_format == "JPEG":
+        use_ext = ".jpg"
+    elif actual_format == "PNG":
+        use_ext = ".png"
+    elif actual_format in ("TIFF", "TIFF"):
+        use_ext = ".tiff"
+    elif actual_format == "GIF":
+        use_ext = ".gif"
+    elif actual_format == "BMP":
+        use_ext = ".bmp"
+    elif actual_format == "WEBP":
+        use_ext = ".webp"
+    else:
+        use_ext = ext  # 回退到扩展名
+
     img = _resize_if_needed(img, preset["doc_max_dim"])
 
     out = io.BytesIO()
-    if ext in {".jpg", ".jpeg"}:
+    if use_ext in {".jpg", ".jpeg"}:
         img = img.convert("RGB")
         img.save(out, "JPEG", quality=preset["doc_quality"], optimize=True, progressive=True)
-    elif ext == ".png":
+    elif use_ext == ".png":
         img.save(out, "PNG", optimize=True)
-    elif ext == ".gif":
+    elif use_ext == ".gif":
         img.save(out, "GIF", optimize=True)
-    elif ext == ".bmp":
+    elif use_ext == ".bmp":
         img = img.convert("RGB")
         img.save(out, "BMP")
-    elif ext in {".tif", ".tiff"}:
+    elif use_ext in {".tif", ".tiff"}:
         img.save(out, "TIFF", compression="tiff_lzw")
-    elif ext == ".webp":
+    elif use_ext == ".webp":
         img.save(out, "WEBP", quality=preset["doc_quality"], method=6)
     else:
         return None
@@ -70,7 +89,7 @@ def _compress_media_same_ext_bytes(data: bytes, ext: str, preset: dict, media_ki
                     "ffmpeg", "-y", "-i", str(tmp_in),
                     "-c:a", preset["audio_codec"],
                     "-b:a", preset["audio_bitrate"],
-                    "-ar", "12000",
+                    "-ar", "44100",
                     "-ac", "1",
                     str(tmp_out),
                 ]
@@ -90,12 +109,12 @@ def _compress_media_same_ext_bytes(data: bytes, ext: str, preset: dict, media_ki
                     "-vf", scale_filter,
                     "-c:a", "aac",
                     "-b:a", preset["video_audio_bitrate"],
-                    "-ar", "12000",
+                    "-ar", "44100",
                     "-ac", "1",
-                    str(tmp_out),
                 ]
                 if preset.get("video_codec") == "libx265":
                     cmd += ["-tag:v", "hvc1", "-x265-params", "log-level=error"]
+                cmd.append(str(tmp_out))
 
             result = subprocess.run(cmd, capture_output=True, timeout=3600)
             if result.returncode != 0 or not tmp_out.exists():
@@ -167,20 +186,46 @@ def _process_keynote_entries(entries: Dict[str, bytes], preset: dict) -> Dict[st
     return out_entries
 
 
+def _fix_zip_filename(info: zipfile.ZipInfo) -> str:
+    """
+    Keynote 创建的 ZIP 文件中，部分中文文件名以 UTF-8 字节存储，
+    但未设 UTF-8 flag（flag_bits=0）。Python zipfile 会将这些字节
+    按 CP437 解码成乱码字符串。
+    写回时 Python 会将乱码字符串重新按 UTF-8 编码，导致文件名字节
+    完全不同，Keynote 无法找到对应文件，报"已损坏"。
+    本函数将 CP437 乱码还原为正确的 UTF-8 文件名。
+    """
+    if info.flag_bits & 0x800:
+        # 已有 UTF-8 flag，Python 已正确解码，无需修复
+        return info.filename
+    if not any(ord(c) > 127 for c in info.filename):
+        # 纯 ASCII，无问题
+        return info.filename
+    try:
+        # 将 CP437 解码结果重新编码为 CP437 字节，再按 UTF-8 解码
+        return info.filename.encode("cp437").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return info.filename
+
+
 def _compress_keynote_zip(src: Path, dst: Path, preset: dict) -> bool:
     with zipfile.ZipFile(src, "r") as zin:
-        names = zin.namelist()
-        entries = {name: zin.read(name) for name in names}
+        infolist = zin.infolist()
+        # 修复文件名编码，同时保留 orig→fixed 的映射用于读取数据
+        name_map = [(info.filename, _fix_zip_filename(info)) for info in infolist]
+        entries = {}
+        for orig, fixed in name_map:
+            entries[fixed] = zin.read(orig) if not orig.endswith("/") else b""
 
     new_entries = _process_keynote_entries(entries, preset)
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zout:
-        for name in names:
-            if name.endswith("/"):
-                zout.writestr(name, b"")
+    with zipfile.ZipFile(dst, "w", zipfile.ZIP_STORED) as zout:
+        for _orig, fixed in name_map:
+            if fixed.endswith("/"):
+                zout.writestr(fixed, b"")
             else:
-                zout.writestr(name, new_entries.get(name, entries[name]))
+                zout.writestr(fixed, new_entries.get(fixed, entries[fixed]))
     return True
 
 
